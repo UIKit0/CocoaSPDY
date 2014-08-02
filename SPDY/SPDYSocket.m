@@ -503,7 +503,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 
 - (void)_endConnectTimeout
 {
-    dispatch_source_cancel(_connectTimer);
+    if (_connectTimer) dispatch_source_cancel(_connectTimer);
     _connectTimer = NULL;
 }
 
