@@ -28,6 +28,7 @@
 #import "SPDYStream.h"
 #import "SPDYStreamManager.h"
 #import "SPDYTLSTrustEvaluator.h"
+#import "SPDYDispatchQueue.h"
 
 // The input buffer should be more than twice MAX_CHUNK_LENGTH and
 // MAX_COMPRESSED_HEADER_BLOCK_LENGTH to avoid having to resize the
@@ -38,11 +39,17 @@
 #define REMOTE_MAX_CONCURRENT_STREAMS  INT32_MAX
 #define INCLUDE_SPDY_RESPONSE_HEADERS  1
 
-NSString *const SPDYSessionQueueName = @"SPDYSession";
-static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
+#define CHECK_THREAD_SAFETY() \
+do { \
+if (_dispatchQueue && !_dispatchQueue.isExecutingOnQueue) { \
+[NSException raise:SPDYSocketException \
+format:@"Detected SPDYSession access from wrong dispatch queue."]; \
+} \
+} while (0)
 
 @interface SPDYSession () <SPDYFrameDecoderDelegate, SPDYFrameEncoderDelegate, SPDYStreamDataDelegate, SPDYSocketDelegate>
 @property (nonatomic, readonly) SPDYStreamId nextStreamId;
+@property (nonatomic) SPDYDispatchQueue *dispatchQueue;
 - (void)_sendSynStream:(SPDYStream *)stream streamId:(SPDYStreamId)streamId closeLocal:(bool)close;
 - (void)_sendData:(SPDYStream *)stream;
 - (void)_sendWindowUpdate:(uint32_t)deltaWindowSize streamId:(SPDYStreamId)streamId;
@@ -60,7 +67,6 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
     SPDYStreamManager *_inactiveStreams;
     SPDYSocket *_socket;
     NSMutableData *_inputBuffer;
-    dispatch_queue_t _dispatchQueue;
 
     SPDYStreamId _lastGoodStreamId;
     SPDYStreamId _nextStreamId;
@@ -102,9 +108,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
             return nil;
         }
 
-        _dispatchQueue = dispatch_queue_create([SPDYSessionQueueName UTF8String], DISPATCH_QUEUE_SERIAL);
-        void *nonNullUnusedPointer = (__bridge void *)self;
-        dispatch_queue_set_specific(_dispatchQueue, SPDYSessionIsOnSessionQueue, nonNullUnusedPointer, NULL);
+        _dispatchQueue = [SPDYDispatchQueue new];
         SPDYSocket *socket = [[SPDYSocket alloc] initWithDelegate:self dispatchQueue:_dispatchQueue];
         bool connecting = [socket connectToHost:origin.host
                                          onPort:origin.port
@@ -112,7 +116,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
                                           error:pError];
 
         if (connecting) {
-            dispatch_sync(_dispatchQueue, ^{
+            [_dispatchQueue performBlock:^{
                 _configuration = configuration;
                 _socket = socket;
                 _origin = origin;
@@ -173,7 +177,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
                 uint32_t deltaWindowSize = _sessionReceiveWindowSize - DEFAULT_WINDOW_SIZE;
                 [self _sendWindowUpdate:deltaWindowSize streamId:kSPDYSessionStreamId];
                 [self _sendPing:1];
-            });
+            }];
         } else {
             self = nil;
         }
@@ -181,28 +185,10 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
     return self;
 }
 
-- (void)synchronouslyPerformBlockOnSocketQueue:(void (^)())block
-{
-    if (dispatch_get_specific(SPDYSessionIsOnSessionQueue)) {
-        block();
-    } else {
-        dispatch_sync(_dispatchQueue, block);
-    }
-}
-
-- (void)asynchronouslyPerformBlockOnSocketQueue:(void (^)())block
-{
-    if (dispatch_get_specific(SPDYSessionIsOnSessionQueue)) {
-        block();
-    } else {
-        dispatch_async(_dispatchQueue, block);
-    }
-}
-
 - (void)issueRequest:(SPDYProtocol *)protocol
 {
-    [self synchronouslyPerformBlockOnSocketQueue:^{
-        SPDYStream *stream = [[SPDYStream alloc] initWithProtocol:protocol dataDelegate:self];
+    [_dispatchQueue performBlockAndWait:^{
+        SPDYStream *stream = [[SPDYStream alloc] initWithProtocol:protocol dispatchQueue:_dispatchQueue dataDelegate:self];
 
         if (_activeStreams.localCount >= _remoteMaxConcurrentStreams) {
             [_inactiveStreams addStream:stream];
@@ -216,6 +202,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)_issuePendingRequests
 {
+    CHECK_THREAD_SAFETY();
     SPDYStream *stream;
 
     while (_inactiveStreams.localCount > 0 && _activeStreams.localCount < _remoteMaxConcurrentStreams) {
@@ -227,6 +214,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)_startStream:(SPDYStream *)stream
 {
+    CHECK_THREAD_SAFETY();
     SPDYStreamId streamId = [self nextStreamId];
     [stream startWithStreamId:streamId
                sendWindowSize:_initialSendWindowSize
@@ -244,7 +232,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)cancelRequest:(SPDYProtocol *)protocol
 {
-    [self synchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlockAndWait:^{
         SPDYStream *stream = _activeStreams[protocol];
         if (!stream) {
             stream = _inactiveStreams[protocol];
@@ -262,7 +250,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)dealloc
 {
-    [self synchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlockAndWait:^{
         _frameDecoder.delegate = nil;
         _frameEncoder.delegate = nil;
         [_socket disconnect];
@@ -281,7 +269,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)close
 {
-    [self synchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlockAndWait:^{
         if (!_closing) {
             _closing = YES;
             [self _closeWithStatus:SPDY_SESSION_OK];
@@ -291,6 +279,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)_closeWithStatus:(SPDYSessionStatus)status
 {
+    CHECK_THREAD_SAFETY();
     if (!_sentGoAwayFrame) {
         [self _sendGoAway:status];
     }
@@ -313,6 +302,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (bool)socket:(SPDYSocket *)socket securedWithTrust:(SecTrustRef)trust
 {
+    CHECK_THREAD_SAFETY();
     _lastSocketActivity = CFAbsoluteTimeGetCurrent();
     id<SPDYTLSTrustEvaluator> evaluator = [SPDYProtocol sharedTLSTrustEvaluator];
     return evaluator == nil || [evaluator evaluateServerTrust:trust forHost:_origin.host];
@@ -320,6 +310,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)socket:(SPDYSocket *)socket didConnectToHost:(NSString *)host port:(in_port_t)port
 {
+    CHECK_THREAD_SAFETY();
     _lastSocketActivity = CFAbsoluteTimeGetCurrent();
     SPDY_DEBUG(@"socket connected to %@:%u", host, port);
 
@@ -333,6 +324,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)socket:(SPDYSocket *)socket didReadData:(NSData *)data withTag:(long)tag
 {
+    CHECK_THREAD_SAFETY();
     _lastSocketActivity = CFAbsoluteTimeGetCurrent();
     SPDY_DEBUG(@"socket read[%li] (%lu)", tag, (unsigned long)data.length);
 
@@ -358,7 +350,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
         _bufferWriteIndex = 0;
     }
 
-    SPDY_DEBUG(@"socket scheduling read[%li] (%lu:%lu)", (tag + 1), (unsigned long)_bufferReadIndex, (unsigned long)_bufferWriteIndex);
+    SPDY_DEBUG(@"socket scheduling read[%li] (%lu:%lu) (socket=%@)", (tag + 1), (unsigned long)_bufferReadIndex, (unsigned long)_bufferWriteIndex, socket);
     [socket readDataWithTimeout:(NSTimeInterval)-1
                          buffer:_inputBuffer
                    bufferOffset:_bufferWriteIndex
@@ -367,6 +359,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)socket:(SPDYSocket *)socket didWriteDataWithTag:(long)tag
 {
+    CHECK_THREAD_SAFETY();
     _lastSocketActivity = CFAbsoluteTimeGetCurrent();
     if (tag == 1) {
         _sessionPingOut = _lastSocketActivity;
@@ -375,11 +368,13 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)socket:(SPDYSocket *)socket didWritePartialDataOfLength:(NSUInteger)partialLength tag:(long)tag
 {
+    CHECK_THREAD_SAFETY();
     _lastSocketActivity = CFAbsoluteTimeGetCurrent();
 }
 
 - (void)socket:(SPDYSocket *)socket willDisconnectWithError:(NSError *)error
 {
+    CHECK_THREAD_SAFETY();
     _lastSocketActivity = CFAbsoluteTimeGetCurrent();
     SPDY_WARNING(@"session connection error: %@", error);
     for (SPDYStream *stream in _activeStreams) {
@@ -390,6 +385,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)socketDidDisconnect:(SPDYSocket *)socket
 {
+    CHECK_THREAD_SAFETY();
     _lastSocketActivity = CFAbsoluteTimeGetCurrent();
     SPDY_INFO(@"session connection closed");
     [[SPDYProtocol sessionManager] removeSession:self];
@@ -413,11 +409,13 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)didEncodeData:(NSData *)data frameEncoder:(SPDYFrameEncoder *)encoder
 {
+    CHECK_THREAD_SAFETY();
     [_socket writeData:data withTimeout:(NSTimeInterval)-1 tag:0];
 }
 
 - (void)didEncodeData:(NSData *)data withTag:(uint32_t)tag frameEncoder:(SPDYFrameEncoder *)encoder
 {
+    CHECK_THREAD_SAFETY();
     [_socket writeData:data withTimeout:(NSTimeInterval)-1 tag:tag];
 }
 
@@ -425,6 +423,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)didReadDataFrame:(SPDYDataFrame *)dataFrame frameDecoder:(SPDYFrameDecoder *)frameDecoder
 {
+    CHECK_THREAD_SAFETY();
     /*
      * SPDY Data frame processing requirements:
      *
@@ -553,6 +552,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)didReadSynStreamFrame:(SPDYSynStreamFrame *)synStreamFrame frameDecoder:(SPDYFrameDecoder *)frameDecoder
 {
+    CHECK_THREAD_SAFETY();
     /*
      * SPDY SYN_STREAM frame processing requirements:
      *
@@ -617,6 +617,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)didReadSynReplyFrame:(SPDYSynReplyFrame *)synReplyFrame frameDecoder:(SPDYFrameDecoder *)frameDecoder
 {
+    CHECK_THREAD_SAFETY();
     /*
      * SPDY SYN_REPLY frame processing requirements:
      *
@@ -668,6 +669,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)didReadRstStreamFrame:(SPDYRstStreamFrame *)rstStreamFrame frameDecoder:(SPDYFrameDecoder *)frameDecoder
 {
+    CHECK_THREAD_SAFETY();
     /*
      * SPDY RST_STREAM frame processing requirements:
      *
@@ -690,6 +692,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)didReadSettingsFrame:(SPDYSettingsFrame *)settingsFrame frameDecoder:(SPDYFrameDecoder *)frameDecoder
 {
+    CHECK_THREAD_SAFETY();
     /*
      * SPDY SETTINGS frame processing requirements:
      *
@@ -739,6 +742,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)didReadPingFrame:(SPDYPingFrame *)pingFrame frameDecoder:(SPDYFrameDecoder *)frameDecoder
 {
+    CHECK_THREAD_SAFETY();
     /*
      * SPDY PING frame processing requirements:
      *
@@ -763,6 +767,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)didReadGoAwayFrame:(SPDYGoAwayFrame *)goAwayFrame frameDecoder:(SPDYFrameDecoder *)frameDecoder
 {
+    CHECK_THREAD_SAFETY();
     SPDY_DEBUG(@"received GOAWAY.%u (%u)", goAwayFrame.lastGoodStreamId, goAwayFrame.statusCode);
 
     _receivedGoAwayFrame = YES;
@@ -774,6 +779,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)didReadHeadersFrame:(SPDYHeadersFrame *)headersFrame frameDecoder:(SPDYFrameDecoder *)frameDecoder
 {
+    CHECK_THREAD_SAFETY();
     SPDYStreamId streamId = headersFrame.streamId;
     SPDYStream *stream = _activeStreams[streamId];
     SPDY_DEBUG(@"received HEADERS.%u", streamId);
@@ -801,6 +807,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)didReadWindowUpdateFrame:(SPDYWindowUpdateFrame *)windowUpdateFrame frameDecoder:(SPDYFrameDecoder *)frameDecoder
 {
+    CHECK_THREAD_SAFETY();
     /*
      * SPDY WINDOW_UPDATE frame processing requirements:
      *
@@ -850,6 +857,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)stream:(SPDYStream *)stream didReceivePushResponse:(NSURLResponse *)response data:(NSData *)data
 {
+    CHECK_THREAD_SAFETY();
     if ([[self delegate] respondsToSelector:@selector(session:didReceivePushResponse:data:)]) {
         [[self delegate] session:self didReceivePushResponse:response data:data];
     }
@@ -859,6 +867,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (SPDYStreamId)nextStreamId
 {
+    CHECK_THREAD_SAFETY();
     SPDYStreamId streamId = _nextStreamId;
     _nextStreamId += 2;
     return streamId;
@@ -866,6 +875,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)_sendServerPersistedSettings:(SPDYSettings *)persistedSettings
 {
+    CHECK_THREAD_SAFETY();
     if (persistedSettings != NULL) {
         SPDYSettingsFrame *settingsFrame = [[SPDYSettingsFrame alloc] init];
         SPDY_SETTINGS_ITERATOR(i) {
@@ -879,6 +889,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)_sendClientSettings
 {
+    CHECK_THREAD_SAFETY();
     SPDYSettingsFrame *settingsFrame = [[SPDYSettingsFrame alloc] init];
     if (_enableSettingsMinorVersion) {
         settingsFrame.settings[SPDY_SETTINGS_MINOR_VERSION].set = YES;
@@ -895,6 +906,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)_sendSynStream:(SPDYStream *)stream streamId:(SPDYStreamId)streamId closeLocal:(bool)close
 {
+    CHECK_THREAD_SAFETY();
     SPDYSynStreamFrame *synStreamFrame = [[SPDYSynStreamFrame alloc] init];
     synStreamFrame.streamId = streamId;
     synStreamFrame.priority = stream.priority;
@@ -910,60 +922,63 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)_sendData:(SPDYStream *)stream
 {
-    SPDYStreamId streamId = stream.streamId;
-    uint32_t sendWindowSize = MIN(_sessionSendWindowSize, stream.sendWindowSize);
+    [_dispatchQueue performBlockAndWait:^{
+        SPDYStreamId streamId = stream.streamId;
+        uint32_t sendWindowSize = MIN(_sessionSendWindowSize, stream.sendWindowSize);
 
-    while (!stream.localSideClosed && stream.hasDataAvailable && sendWindowSize > 0) {
-        NSError *error;
-        NSData *data = [stream readData:sendWindowSize error:&error];
+        while (!stream.localSideClosed && stream.hasDataAvailable && sendWindowSize > 0) {
+            NSError *error;
+            NSData *data = [stream readData:sendWindowSize error:&error];
 
-        if (data) {
+            if (data) {
+                SPDYDataFrame *dataFrame = [[SPDYDataFrame alloc] init];
+                dataFrame.streamId = streamId;
+                dataFrame.data = data;
+                dataFrame.last = !stream.hasDataPending;
+                [_frameEncoder encodeDataFrame:dataFrame];
+                SPDY_DEBUG(@"sent DATA.%u%@ (%lu)", streamId, dataFrame.last ? @"!" : @"", (unsigned long)dataFrame.data.length);
+
+                uint32_t bytesSent = (uint32_t)data.length;
+                sendWindowSize -= bytesSent;
+                _sessionSendWindowSize -= bytesSent;
+                stream.sendWindowSize -= bytesSent;
+                stream.localSideClosed = dataFrame.last;
+            } else {
+                if (error) {
+                    [self _sendRstStream:SPDY_STREAM_CANCEL streamId:streamId];
+                    [stream closeWithError:error];
+                    [_activeStreams removeStreamWithStreamId:streamId];
+                    [self _issuePendingRequests];
+                }
+
+                // -[SPDYStream hasDataAvailable] may return true if we need to perform
+                // a read on a stream to determine if data is actually available. This
+                // mirrors Apple's API with [NSStream -hasBytesAvailable]. The break here
+                // should technically be unnecessary, but it doesn't hurt.
+                break;
+            }
+        }
+
+        if (!stream.hasDataPending && !stream.localSideClosed) {
             SPDYDataFrame *dataFrame = [[SPDYDataFrame alloc] init];
             dataFrame.streamId = streamId;
-            dataFrame.data = data;
-            dataFrame.last = !stream.hasDataPending;
+            dataFrame.last = YES;
             [_frameEncoder encodeDataFrame:dataFrame];
             SPDY_DEBUG(@"sent DATA.%u%@ (%lu)", streamId, dataFrame.last ? @"!" : @"", (unsigned long)dataFrame.data.length);
 
-            uint32_t bytesSent = (uint32_t)data.length;
-            sendWindowSize -= bytesSent;
-            _sessionSendWindowSize -= bytesSent;
-            stream.sendWindowSize -= bytesSent;
-            stream.localSideClosed = dataFrame.last;
-        } else {
-            if (error) {
-                [self _sendRstStream:SPDY_STREAM_CANCEL streamId:streamId];
-                [stream closeWithError:error];
-                [_activeStreams removeStreamWithStreamId:streamId];
-                [self _issuePendingRequests];
-            }
-
-            // -[SPDYStream hasDataAvailable] may return true if we need to perform
-            // a read on a stream to determine if data is actually available. This
-            // mirrors Apple's API with [NSStream -hasBytesAvailable]. The break here
-            // should technically be unnecessary, but it doesn't hurt.
-            break;
+            stream.localSideClosed = YES;
         }
-    }
 
-    if (!stream.hasDataPending && !stream.localSideClosed) {
-        SPDYDataFrame *dataFrame = [[SPDYDataFrame alloc] init];
-        dataFrame.streamId = streamId;
-        dataFrame.last = YES;
-        [_frameEncoder encodeDataFrame:dataFrame];
-        SPDY_DEBUG(@"sent DATA.%u%@ (%lu)", streamId, dataFrame.last ? @"!" : @"", (unsigned long)dataFrame.data.length);
-
-        stream.localSideClosed = YES;
-    }
-
-    if (stream.closed) {
-        [_activeStreams removeStreamWithStreamId:streamId];
-        [self _issuePendingRequests];
-    }
+        if (stream.closed) {
+            [_activeStreams removeStreamWithStreamId:streamId];
+            [self _issuePendingRequests];
+        }
+    }];
 }
 
 - (void)_sendWindowUpdate:(uint32_t)deltaWindowSize streamId:(SPDYStreamId)streamId
 {
+    CHECK_THREAD_SAFETY();
     SPDYWindowUpdateFrame *windowUpdateFrame = [[SPDYWindowUpdateFrame alloc] init];
     windowUpdateFrame.streamId = streamId;
     windowUpdateFrame.deltaWindowSize = deltaWindowSize;
@@ -973,6 +988,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)_sendPing:(SPDYPingId)pingId
 {
+    CHECK_THREAD_SAFETY();
     SPDYPingFrame *pingFrame = [[SPDYPingFrame alloc] init];
     pingFrame.pingId = pingId;
     [_frameEncoder encodePingFrame:pingFrame];
@@ -981,12 +997,14 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)_sendPingResponse:(SPDYPingFrame *)pingFrame
 {
+    CHECK_THREAD_SAFETY();
     [_frameEncoder encodePingFrame:pingFrame];
     SPDY_DEBUG(@"sent PING.%u response", pingFrame.pingId);
 }
 
 - (void)_sendRstStream:(SPDYStreamStatus)status streamId:(SPDYStreamId)streamId
 {
+    CHECK_THREAD_SAFETY();
     SPDYRstStreamFrame *rstStreamFrame = [[SPDYRstStreamFrame alloc] init];
     rstStreamFrame.streamId = streamId;
     rstStreamFrame.statusCode = status;
@@ -996,6 +1014,7 @@ static void *SPDYSessionIsOnSessionQueue = &SPDYSessionIsOnSessionQueue;
 
 - (void)_sendGoAway:(SPDYSessionStatus)status
 {
+    CHECK_THREAD_SAFETY();
     SPDYGoAwayFrame *goAwayFrame = [[SPDYGoAwayFrame alloc] init];
     goAwayFrame.lastGoodStreamId = _lastGoodStreamId;
     goAwayFrame.statusCode = status;

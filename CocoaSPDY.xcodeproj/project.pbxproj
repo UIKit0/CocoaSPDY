@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		25536E6119C0B09C00D715E3 /* SPDYDispatchQueue.m in Sources */ = {isa = PBXBuildFile; fileRef = 25536E6019C0B09C00D715E3 /* SPDYDispatchQueue.m */; };
 		25B6D34C1947DFA1009BBA9F /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 25B6D34B1947DFA1009BBA9F /* Foundation.framework */; };
 		25B6D35A1947DFA2009BBA9F /* XCTest.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 25B6D3591947DFA2009BBA9F /* XCTest.framework */; };
 		25B6D35B1947DFA2009BBA9F /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 25B6D34B1947DFA1009BBA9F /* Foundation.framework */; };
@@ -67,6 +68,8 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		25536E5F19C0B09C00D715E3 /* SPDYDispatchQueue.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = SPDYDispatchQueue.h; sourceTree = "<group>"; };
+		25536E6019C0B09C00D715E3 /* SPDYDispatchQueue.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = SPDYDispatchQueue.m; sourceTree = "<group>"; };
 		25B6D3481947DFA1009BBA9F /* libCocoaSPDY.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libCocoaSPDY.a; sourceTree = BUILT_PRODUCTS_DIR; };
 		25B6D34B1947DFA1009BBA9F /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
 		25B6D3581947DFA2009BBA9F /* CocoaSPDYTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = CocoaSPDYTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -234,6 +237,8 @@
 				25B6D3961947DFDD009BBA9F /* SPDYStreamManager.m */,
 				25B6D3971947DFDD009BBA9F /* SPDYTLSTrustEvaluator.h */,
 				25B6D3981947DFDD009BBA9F /* SPDYZLibCommon.h */,
+				25536E5F19C0B09C00D715E3 /* SPDYDispatchQueue.h */,
+				25536E6019C0B09C00D715E3 /* SPDYDispatchQueue.m */,
 			);
 			path = SPDY;
 			sourceTree = "<group>";
@@ -386,6 +391,7 @@
 				25B6D3A61947E01F009BBA9F /* NSURLRequest+SPDYURLRequest.m in Sources */,
 				25B6D3A91947E01F009BBA9F /* SPDYCommonLogger.m in Sources */,
 				25B6D3AD1947E01F009BBA9F /* SPDYFrame.m in Sources */,
+				25536E6119C0B09C00D715E3 /* SPDYDispatchQueue.m in Sources */,
 				25B6D3AF1947E01F009BBA9F /* SPDYFrameDecoder.m in Sources */,
 				25B6D3B11947E01F009BBA9F /* SPDYFrameEncoder.m in Sources */,
 				25B6D3B31947E01F009BBA9F /* SPDYHeaderBlockCompressor.m in Sources */,

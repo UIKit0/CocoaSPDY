@@ -19,11 +19,12 @@
 #import "SPDYError.h"
 #import "SPDYProtocol.h"
 #import "SPDYStream.h"
+#import "SPDYDispatchQueue.h"
 
 #define DECOMPRESSED_CHUNK_LENGTH 8192
 #define MIN_WRITE_CHUNK_LENGTH 4096
 #define MAX_WRITE_CHUNK_LENGTH 131072
-#define USE_CFSTREAM 0
+#define USE_CFSTREAM 1
 
 #if USE_CFSTREAM
 #define SCHEDULE_STREAM() [self _scheduleCFReadStream]
@@ -33,23 +34,38 @@
 #define UNSCHEDULE_STREAM() [self _unscheduleNSInputStream]
 #endif
 
+#define DEBUG_THREAD_SAFETY 1
+
+#if DEBUG_THREAD_SAFETY
+    #define CHECK_THREAD_SAFETY() \
+    do { \
+        if (_dispatchQueue && !_dispatchQueue.isExecutingOnQueue) { \
+            [NSException raise:NSInternalInconsistencyException \
+                        format:@"Detected SPDYSocket access from wrong dispatch queue."]; \
+        } \
+    } while (0)
+#else
+    #define CHECK_THREAD_SAFETY()
+#endif
+
 @interface SPDYStream () <NSStreamDelegate>
 - (void)_scheduleCFReadStream;
 - (void)_unscheduleCFReadStream;
-- (void)_scheduleNSInputStream;
-- (void)_unscheduleNSInputStream;
+//- (void)_scheduleNSInputStream;
+//- (void)_unscheduleNSInputStream;
 @end
 
 @implementation SPDYStream
 {
+    SPDYDispatchQueue *_dispatchQueue;
     NSData *_data;
     NSMutableData *_pushData;
     NSDictionary *_headers;
     NSURLResponse *_pushResponse;
     NSString *_dataFile;
     NSInputStream *_dataStream;
-    NSRunLoop *_runLoop;
     CFReadStreamRef _dataStreamRef;
+    NSRunLoop *_runLoop;
     CFRunLoopRef _runLoopRef;
     NSUInteger _writeDataIndex;
     NSUInteger _writeStreamChunkLength;
@@ -73,13 +89,14 @@
     return self;
 }
 
-- (id)initWithProtocol:(SPDYProtocol *)protocol dataDelegate:(id<SPDYStreamDataDelegate>)delegate
+- (id)initWithProtocol:(SPDYProtocol *)protocol dispatchQueue:(SPDYDispatchQueue *)dispatchQueue dataDelegate:(id<SPDYStreamDataDelegate>)delegate
 {
     self = [super init];
     if (self) {
         _protocol = protocol;
         _client = protocol.client;
         _request = protocol.request;
+        _dispatchQueue = dispatchQueue;
         _priority = MIN((uint8_t)_request.SPDYPriority, 0x07);
         _local = YES;
         _localSideClosed = NO;
@@ -92,6 +109,7 @@
 
 - (void)startWithStreamId:(SPDYStreamId)streamId sendWindowSize:(uint32_t)sendWindowSize receiveWindowSize:(uint32_t)receiveWindowSize
 {
+    CHECK_THREAD_SAFETY();
     _streamId = streamId;
     _sendWindowSize = sendWindowSize;
     _receiveWindowSize = receiveWindowSize;
@@ -120,6 +138,7 @@
 
 - (void)setDataStream:(NSInputStream *)dataStream
 {
+    CHECK_THREAD_SAFETY();
     _dataStream = dataStream;
     _dataStreamRef = (__bridge CFReadStreamRef)dataStream;
 }
@@ -137,12 +156,14 @@
 
 - (void)setProtocol:(SPDYProtocol *)protocol
 {
+    CHECK_THREAD_SAFETY();
     _protocol = protocol;
     _client = protocol.client;
 }
 
 - (void)closeWithError:(NSError *)error
 {
+    CHECK_THREAD_SAFETY();
     if (_client) {
         // Failing to pass an error here leads to null pointer exception
         if (!error) {
@@ -154,6 +175,7 @@
 
 - (void)closeWithStatus:(SPDYStreamStatus)status
 {
+    CHECK_THREAD_SAFETY();
     if (_client) {
         NSError *error = SPDY_STREAM_ERROR((SPDYStreamError)status, @"SPDY stream closed.");
         [_client URLProtocol:_protocol didFailWithError:error];
@@ -162,6 +184,7 @@
 
 - (void)setLocalSideClosed:(bool)localSideClosed
 {
+    CHECK_THREAD_SAFETY();
     _localSideClosed = localSideClosed;
     if (_localSideClosed && _remoteSideClosed && _client) {
         [_client URLProtocolDidFinishLoading:_protocol];
@@ -170,6 +193,7 @@
 
 - (void)setRemoteSideClosed:(bool)remoteSideClosed
 {
+    CHECK_THREAD_SAFETY();
     _remoteSideClosed = remoteSideClosed;
     if (_localSideClosed && _remoteSideClosed && _client) {
         [_client URLProtocolDidFinishLoading:_protocol];
@@ -194,6 +218,7 @@
 
 - (bool)hasDataAvailable
 {
+    CHECK_THREAD_SAFETY();
     bool writeStreamAvailable = (
         _dataStream &&
         _writeStreamOpened &&
@@ -207,6 +232,7 @@
 
 - (bool)hasDataPending
 {
+    CHECK_THREAD_SAFETY();
     bool writeStreamPending = (
         _dataStream &&
         (!_writeStreamOpened || _dataStream.streamStatus < NSStreamStatusAtEnd)
@@ -218,6 +244,7 @@
 
 - (NSData *)readData:(NSUInteger)length error:(NSError **)pError
 {
+    CHECK_THREAD_SAFETY();
     if (_dataStream) {
         if (length > 0 && _dataStream.hasBytesAvailable) {
             NSUInteger maxLength = MIN(length, _writeStreamChunkLength);
@@ -260,6 +287,7 @@
 
 - (BOOL)didReceiveResponse:(NSDictionary *)newHeaders
 {
+    CHECK_THREAD_SAFETY();
     _receivedReply = YES;
     _ignoreHeaders = NO;
     
@@ -368,6 +396,7 @@
 
 - (void)didLoadData:(NSData *)data
 {
+    CHECK_THREAD_SAFETY();
     NSUInteger dataLength = data.length;
     if (dataLength == 0) return;
 
@@ -425,6 +454,7 @@
 
 - (BOOL)mergeHeaders:(NSDictionary *)headers
 {
+    CHECK_THREAD_SAFETY();
     if (!_headers) {
         _headers = headers;
     } else if (!_ignoreHeaders && [[NSSet setWithArray:[_headers allKeys]] intersectsSet:[NSSet setWithArray:[headers allKeys]]]) {
@@ -461,6 +491,7 @@ static void SPDYStreamCFReadStreamCallback(CFReadStreamRef stream, CFStreamEvent
 
 - (void)handleDataStreamEvent:(CFStreamEventType)eventType
 {
+    CHECK_THREAD_SAFETY();
     if (eventType & kCFStreamEventOpenCompleted) {
         _writeStreamOpened = YES;
     } else if (!_writeStreamOpened) {
@@ -479,6 +510,7 @@ static void SPDYStreamCFReadStreamCallback(CFReadStreamRef stream, CFStreamEvent
 
 - (void)stream:(NSStream *)aStream handleEvent:(NSStreamEvent)eventCode
 {
+    CHECK_THREAD_SAFETY();
     if (eventCode & NSStreamEventOpenCompleted) {
         _writeStreamOpened = YES;
     } else if (!_writeStreamOpened) {
@@ -495,6 +527,7 @@ static void SPDYStreamCFReadStreamCallback(CFReadStreamRef stream, CFStreamEvent
 #pragma mark private methods
 - (void)_scheduleCFReadStream
 {
+    CHECK_THREAD_SAFETY();
     SPDY_DEBUG(@"scheduling CFReadStream: %p", _dataStreamRef);
     _runLoopRef = CFRunLoopGetCurrent();
 
@@ -522,37 +555,43 @@ static void SPDYStreamCFReadStreamCallback(CFReadStreamRef stream, CFStreamEvent
         SPDY_ERROR(@"couldn't attach read stream to runloop");
         return;
     }
+    
+    CFReadStreamSetDispatchQueue(_dataStreamRef, _dispatchQueue.dispatchQueue);
 
-    CFReadStreamScheduleWithRunLoop(_dataStreamRef, _runLoopRef, kCFRunLoopDefaultMode);
+//    CFReadStreamScheduleWithRunLoop(_dataStreamRef, _runLoopRef, kCFRunLoopDefaultMode);
     if (!CFReadStreamOpen(_dataStreamRef)) {
         SPDY_ERROR(@"can't open stream: %@", _dataStreamRef);
         return;
     }
 }
 
-- (void)_scheduleNSInputStream
-{
-    SPDY_DEBUG(@"scheduling NSInputStream: %@", _dataStream);
-    _dataStream.delegate = self;
-    _runLoop = [NSRunLoop currentRunLoop];
-    [_dataStream scheduleInRunLoop:_runLoop forMode:NSDefaultRunLoopMode];
-    [_dataStream open];
-}
+//- (void)_scheduleNSInputStream
+//{
+//    CHECK_THREAD_SAFETY();
+//    SPDY_DEBUG(@"scheduling NSInputStream: %@", _dataStream);
+//    _dataStream.delegate = self;
+//    _runLoop = [NSRunLoop currentRunLoop];
+//    [_dataStream scheduleInRunLoop:_runLoop forMode:NSDefaultRunLoopMode];
+//    [_dataStream open];
+//}
 
 - (void)_unscheduleCFReadStream
 {
+    CHECK_THREAD_SAFETY();
     SPDY_DEBUG(@"unscheduling CFReadStream: %p", _dataStreamRef);
     CFReadStreamClose(_dataStreamRef);
     CFReadStreamSetClient(_dataStreamRef, kCFStreamEventNone, NULL, NULL);
-    _runLoopRef = NULL;
+    _runLoopRef = NULL;    
+    CFReadStreamSetDispatchQueue(_dataStreamRef, NULL);
 }
 
-- (void)_unscheduleNSInputStream
-{
-    SPDY_DEBUG(@"unscheduling NSInputStream: %@", _dataStream);
-    [_dataStream close];
-    _dataStream.delegate = nil;
-    _runLoop = nil;
-}
+//- (void)_unscheduleNSInputStream
+//{
+//    CHECK_THREAD_SAFETY();
+//    SPDY_DEBUG(@"unscheduling NSInputStream: %@", _dataStream);
+//    [_dataStream close];
+//    _dataStream.delegate = nil;
+//    _runLoop = nil;
+//}
 
 @end

@@ -130,14 +130,6 @@ static id<SPDYTLSTrustEvaluator> trustEvaluator;
 @implementation SPDYURLSessionProtocol
 @end
 
-
-//__attribute__((constructor))
-//static void registerSPDYURLConnectionProtocol() {
-//    @autoreleasepool {
-//        [NSURLProtocol registerClass:[SPDYURLConnectionProtocol class]];
-//    }
-//}
-
 #pragma mark NSURLConnection implementation
 
 @implementation SPDYURLConnectionProtocol

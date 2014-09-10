@@ -154,6 +154,7 @@ static void SPDYReachabilityCallback(SCNetworkReachabilityRef target, SCNetworkR
             }
         }
         
+        NSAssert(session != nil, @"session should not be nil");
         SPDY_DEBUG(@"Retrieving session: %@", session);
         if ([self.delegate respondsToSelector:@selector(sessionManager:willStartSession:forURL:)]) {
             [self.delegate sessionManager:self willStartSession:session forURL:url];
@@ -164,6 +165,7 @@ static void SPDYReachabilityCallback(SCNetworkReachabilityRef target, SCNetworkR
 
 - (void)removeSession:(SPDYSession *)session
 {
+    NSParameterAssert(session);
     dispatch_sync(_dispatchQueue, ^{
         SPDY_DEBUG(@"Removing session: %@", session);
         SPDYOrigin *origin = session.origin;

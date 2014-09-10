@@ -20,6 +20,7 @@
 #import <sys/socket.h>
 #import "SPDYSocket.h"
 #import "SPDYCommonLogger.h"
+#import "SPDYDispatchQueue.h"
 
 #pragma mark Declarations
 
@@ -33,7 +34,7 @@
 #if DEBUG_THREAD_SAFETY
 #define CHECK_THREAD_SAFETY() \
 do { \
-    if (_socketQueue && !dispatch_get_specific(SPDYSocketIsOnSocketQueue)) { \
+    if (_dispatchQueue && !_dispatchQueue.isExecutingOnQueue) { \
         [NSException raise:SPDYSocketException \
                     format:@"Detected SPDYSocket access from wrong dispatch queue."]; \
     } \
@@ -282,6 +283,10 @@ static void SPDYSocketCFWriteStreamCallback(CFWriteStreamRef stream, CFStreamEve
 
 static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 
+@interface SPDYSocket ()
+@property (nonatomic) SPDYDispatchQueue *dispatchQueue;
+@end
+
 @implementation SPDYSocket
 {
     CFSocketNativeHandle _socket4FD;
@@ -293,7 +298,6 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
     CFReadStreamRef _readStream;
     CFWriteStreamRef _writeStream;
 
-    dispatch_queue_t _socketQueue;
     CFRunLoopSourceRef _source4; // For _socket4
     CFRunLoopSourceRef _source6; // For _socket6
     CFSocketContext _context;
@@ -318,8 +322,10 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
     @throw [NSException exceptionWithName:NSInternalInconsistencyException reason:@"Failed to call designated initializer. Call `initWithDelegate:dispatchQueue:` instead." userInfo:nil];
 }
 
-- (id)initWithDelegate:(id<SPDYSocketDelegate>)delegate dispatchQueue:(dispatch_queue_t)dispatchQueue
+- (id)initWithDelegate:(id<SPDYSocketDelegate>)delegate dispatchQueue:(SPDYDispatchQueue *)dispatchQueue
 {
+    NSParameterAssert(delegate);
+    NSParameterAssert(dispatchQueue);
     self = [super init];
     if (self) {
         _delegate = delegate;
@@ -328,10 +334,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
         _socket6FD = 0;
         _readQueue = [[NSMutableArray alloc] initWithCapacity:READ_QUEUE_CAPACITY];
         _writeQueue = [[NSMutableArray alloc] initWithCapacity:WRITE_QUEUE_CAPACITY];
-        
-        _socketQueue = dispatchQueue;
-        void *nonNullUnusedPointer = (__bridge void *)self;
-        dispatch_queue_set_specific(_socketQueue, SPDYSocketIsOnSocketQueue, nonNullUnusedPointer, NULL);
+        _dispatchQueue = dispatchQueue;
 
         NSAssert(sizeof(CFSocketContext) == sizeof(CFStreamClientContext), @"CFSocketContext != CFStreamClientContext");
         _context.version = 0;
@@ -343,30 +346,11 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
     return self;
 }
 
-- (void)synchronouslyPerformBlockOnSocketQueue:(void (^)())block
-{
-    if (dispatch_get_specific(SPDYSocketIsOnSocketQueue)) {
-        block();
-    } else {
-        dispatch_sync(_socketQueue, block);
-    }
-}
-
-- (void)asynchronouslyPerformBlockOnSocketQueue:(void (^)())block
-{
-    if (dispatch_get_specific(SPDYSocketIsOnSocketQueue)) {
-        block();
-    } else {
-        dispatch_async(_socketQueue, block);
-    }
-}
-
 - (void)dealloc
 {
-    [self synchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlockAndWait:^{
         [self _close];
     }];
-    [NSObject cancelPreviousPerformRequestsWithTarget:self];
 }
 
 
@@ -375,7 +359,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 - (id<SPDYSocketDelegate>)delegate
 {
     __block id delegate;
-    [self synchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlockAndWait:^{
         delegate = _delegate;
     }];
     return delegate;
@@ -383,7 +367,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 
 - (void)setDelegate:(id<SPDYSocketDelegate>)delegate
 {
-    [self synchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlockAndWait:^{
         _delegate = delegate;
     }];
 }
@@ -391,7 +375,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 - (CFSocketRef)cfSocket
 {
     __block CFSocketRef socket;
-    [self synchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlockAndWait:^{
         socket = _socket4 ?: _socket6;
     }];
     return socket;
@@ -400,7 +384,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 - (CFReadStreamRef)cfReadStream
 {
     __block CFReadStreamRef stream;
-    [self synchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlockAndWait:^{
         stream = _readStream;
     }];
     return stream;
@@ -409,7 +393,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 - (CFWriteStreamRef)cfWriteStream
 {
     __block CFWriteStreamRef stream;
-    [self synchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlockAndWait:^{
         stream = _writeStream;
     }];
     return stream;
@@ -450,7 +434,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
                 error:(NSError **)pError
 {
     __block BOOL success;
-    [self synchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlockAndWait:^{
         if (_delegate == nil) {
             [NSException raise:SPDYSocketException
                         format:@"Attempting to connect without a delegate. Set a delegate first."];
@@ -484,7 +468,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 - (void)_startConnectTimeout:(NSTimeInterval)timeout
 {
     if (timeout >= 0.0) {
-        _connectTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _socketQueue);
+        _connectTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _dispatchQueue.dispatchQueue);
         __weak SPDYSocket *weakSelf = self;
         dispatch_source_set_event_handler(_connectTimer, ^{
             @autoreleasepool {
@@ -565,8 +549,8 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
         return NO;
     }
     
-    CFReadStreamSetDispatchQueue(_readStream, _socketQueue);
-    CFWriteStreamSetDispatchQueue(_writeStream, _socketQueue);
+    CFReadStreamSetDispatchQueue(_readStream, _dispatchQueue.dispatchQueue);
+    CFWriteStreamSetDispatchQueue(_writeStream, _dispatchQueue.dispatchQueue);
     
     return YES;
 }
@@ -686,7 +670,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 
 - (void)_closeWithError:(NSError *)error
 {
-    [self asynchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlock:^{
         _flags |= kClosingWithError;
 
         if (_flags & kDidStartDelegate) {
@@ -799,7 +783,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 */
 - (void)disconnect
 {
-    [self asynchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlock:^{
         _delegate = nil;
         [self _close];
     }];
@@ -810,7 +794,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 */
 - (void)disconnectAfterReads
 {
-    [self asynchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlock:^{
         _flags |= (kForbidReadsWrites | kDisconnectAfterReads);
         [self _scheduleDisconnect];
     }];
@@ -821,7 +805,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 */
 - (void)disconnectAfterWrites
 {
-    [self asynchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlock:^{
         _flags |= (kForbidReadsWrites | kDisconnectAfterWrites);
         [self _scheduleDisconnect];
     }];
@@ -832,7 +816,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 */
 - (void)disconnectAfterReadsAndWrites
 {
-    [self asynchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlock:^{
         _flags |= (kForbidReadsWrites | kDisconnectAfterReads | kDisconnectAfterWrites);
         [self _scheduleDisconnect];
     }];
@@ -859,7 +843,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
     }
 
     if (shouldDisconnect) {
-        [self asynchronouslyPerformBlockOnSocketQueue:^{
+        [_dispatchQueue performBlock:^{
             [self disconnect];
         }];
     }
@@ -872,7 +856,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 - (NSData *)unreadData
 {
     __block NSData *unreadData = nil;
-    [self synchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlockAndWait:^{
         if (!(_flags & kClosingWithError)) return;
         
         if (_readStream == NULL) return;
@@ -959,7 +943,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 - (bool)connected
 {
     __block BOOL connected;
-    [self synchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlockAndWait:^{
         CFStreamStatus status;
         
         if (_readStream) {
@@ -990,7 +974,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 - (bool)_fullyDisconnected
 {
     __block BOOL fullyDisconnected;
-    [self synchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlockAndWait:^{
         fullyDisconnected = _socket4FD   == 0    &&
                             _socket6FD   == 0    &&
                             _socket4     == NULL &&
@@ -1003,7 +987,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 
 - (void)_setConnectionProperties
 {
-    [self synchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlockAndWait:^{
         char addrBuf[INET6_ADDRSTRLEN];
 
         if (_socket4FD > 0) {
@@ -1044,7 +1028,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 - (in_port_t)connectedPort
 {
     __block in_port_t connectedPort;
-    [self synchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlockAndWait:^{
         connectedPort = _connectedPort;
     }];
     return connectedPort;
@@ -1053,7 +1037,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 - (NSString *)connectedHost
 {
     __block NSString *connectedHost;
-    [self synchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlockAndWait:^{
         connectedHost = _connectedHost;
     }];
     return connectedHost;
@@ -1062,7 +1046,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 - (bool)isIPv4
 {
     __block BOOL isIPv4;
-    [self synchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlockAndWait:^{
         isIPv4 = (_socket4FD > 0 || _socket4 != NULL);
     }];
     return isIPv4;
@@ -1071,7 +1055,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 - (bool)isIPv6
 {
     __block BOOL isIPv6;
-    [self synchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlockAndWait:^{
         isIPv6 = (_socket6FD > 0 || _socket6 != NULL);
     }];
     return isIPv6;
@@ -1079,11 +1063,6 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 
 
 #pragma mark Reading
-
-- (void)readDataWithTimeout:(NSTimeInterval)timeout tag:(long)tag
-{
-    [self readDataWithTimeout:timeout buffer:nil bufferOffset:0 maxLength:0 tag:tag];
-}
 
 - (void)readDataWithTimeout:(NSTimeInterval)timeout
                      buffer:(NSMutableData *)buffer
@@ -1099,9 +1078,13 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
                   maxLength:(NSUInteger)length
                         tag:(long)tag
 {
-    [self asynchronouslyPerformBlockOnSocketQueue:^{
-        if (offset > buffer.length) return;
-        if (_flags & kForbidReadsWrites) return;
+    [_dispatchQueue performBlock:^{
+        if (offset > buffer.length) {
+            return;
+        }
+        if (_flags & kForbidReadsWrites) {
+            return;
+        }
 
         SPDYSocketReadOp *readOp = [[SPDYSocketReadOp alloc] initWithData:buffer
                                                               startOffset:offset
@@ -1114,18 +1097,13 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
     }];
 }
 
-- (void)readDataToLength:(NSUInteger)length withTimeout:(NSTimeInterval)timeout tag:(long)tag
-{
-    [self readDataToLength:length withTimeout:timeout buffer:nil bufferOffset:0 tag:tag];
-}
-
 - (void)readDataToLength:(NSUInteger)length
              withTimeout:(NSTimeInterval)timeout
                   buffer:(NSMutableData *)buffer
             bufferOffset:(NSUInteger)offset
                      tag:(long)tag
 {
-    [self asynchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlock:^{
         if (length == 0) return;
         if (offset > buffer.length) return;
         if (_flags & kForbidReadsWrites) return;
@@ -1145,7 +1123,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 {
     if ((_flags & kDequeueReadScheduled) == 0) {
         _flags |= kDequeueReadScheduled;
-        [self asynchronouslyPerformBlockOnSocketQueue:^{
+        [_dispatchQueue performBlock:^{
             [self _dequeueRead];
         }];
     }
@@ -1166,7 +1144,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
                 [self _tryTLSHandshake];
             } else {
                 if (_currentReadOp->_timeout >= 0.0) {
-                    _readTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _socketQueue);
+                    _readTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _dispatchQueue.dispatchQueue);
 		
                     __weak SPDYSocket *weakSelf = self;
                     
@@ -1250,14 +1228,17 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
     if (readComplete) {
         [self _finishRead];
         if (!readError) [self _scheduleRead];
+        return;
     } else if (newBytesRead > 0) {
         if ([_delegate respondsToSelector:@selector(socket:didReadPartialDataOfLength:tag:)]) {
             [_delegate socket:self didReadPartialDataOfLength:newBytesRead tag:_currentReadOp->_tag];
         }
+        return;
     }
 
     if (readError) {
         [self _closeWithError:readError];
+        return;
     }
 }
 
@@ -1335,7 +1316,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 
 - (void)writeData:(NSData *)data withTimeout:(NSTimeInterval)timeout tag:(long)tag
 {
-    [self asynchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlock:^{
         if (data == nil || data.length == 0) return;
         if (_flags & kForbidReadsWrites) return;
 
@@ -1348,7 +1329,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 
 - (void)_scheduleWrite
 {
-    [self asynchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlock:^{
         if ((_flags & kDequeueWriteScheduled) == 0) {
             _flags |= kDequeueWriteScheduled;
             [self _dequeueWrite];
@@ -1371,7 +1352,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
                 [self _tryTLSHandshake];
             } else {
                 if (_currentWriteOp->_timeout >= 0.0) {
-                    _writeTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _socketQueue);
+                    _writeTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _dispatchQueue.dispatchQueue);
 		
                     __weak SPDYSocket *weakSelf = self;
                     
@@ -1498,7 +1479,7 @@ static void *SPDYSocketIsOnSocketQueue = &SPDYSocketIsOnSocketQueue;
 
 - (void)secureWithTLS:(NSDictionary *)tlsSettings
 {
-    [self asynchronouslyPerformBlockOnSocketQueue:^{
+    [_dispatchQueue performBlock:^{
         // apparently, using nil settings will prevent us from later being able to
         // obtain the remote host's certificate via CFReadStreamCopyProperty(...)
         SPDYSocketTLSOp *tlsOp = [[SPDYSocketTLSOp alloc] initWithTLSSettings:tlsSettings ?: @{}];

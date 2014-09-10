@@ -17,6 +17,7 @@
 @class SPDYSocket;
 @class SPDYSocketReadOp;
 @class SPDYSocketWriteOp;
+@class SPDYDispatchQueue;
 
 extern NSString *const SPDYSocketException;
 
@@ -50,14 +51,6 @@ extern NSString *const SPDYSocketException;
   the same delegate and will call socket:didConnectToHost:port:.
 */
 - (void)socket:(SPDYSocket *)socket didAcceptNewSocket:(SPDYSocket *)newSocket;
-
-/**
-  Called when a new socket is spawned to handle a connection.
-
-  This method should return the run loop on which the new socket and its
-  delegate should operate. If omitted, [NSRunLoop currentRunLoop] is used.
-*/
-- (NSRunLoop *)socket:(SPDYSocket *)socket wantsRunLoopForNewSocket:(SPDYSocket *)newSocket;
 
 /**
   Called when a socket is about to connect.
@@ -147,7 +140,7 @@ extern NSString *const SPDYSocketException;
 @interface SPDYSocket : NSObject
 @property (nonatomic, weak, readonly) id<SPDYSocketDelegate> delegate;
 
-- (id)initWithDelegate:(id<SPDYSocketDelegate>)delegate dispatchQueue:(dispatch_queue_t)dispatchQueue;
+- (id)initWithDelegate:(id<SPDYSocketDelegate>)delegate dispatchQueue:(SPDYDispatchQueue *)dispatchQueue;
 - (CFSocketRef)cfSocket;
 - (CFReadStreamRef)cfReadStream;
 - (CFWriteStreamRef)cfWriteStream;
