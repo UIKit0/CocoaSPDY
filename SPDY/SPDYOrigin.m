@@ -128,7 +128,7 @@
 
 - (BOOL)matchesURL:(NSURL *)URL
 {
-    return [[URL absoluteString] hasPrefix:_serialization];
+    return [self isEqual:[[SPDYOrigin alloc] initWithURL:URL error:nil]];
 }
 
 @end
